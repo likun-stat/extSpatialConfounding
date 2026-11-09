@@ -946,3 +946,252 @@ plot_mcem_traces <- function(fit,truth_beta=NULL,truth_theta=NULL,
       none=sprintf("Dashed lines: simulation truths%s",jackknife_caption)),outer=TRUE,side=1,line=1,cex=.75)
   invisible(u)
 }
+
+
+
+# Recover latent coefficients at fixed fitted max-id regression parameters.
+# Source maxid_regression_mcem.R and maxid_regression_fast_fit.R first.
+# Base R only. Sourcing this file does not run a fit or start sampling.
+# Validated in R 4.5.0 against independent one-dimensional posterior quadrature,
+# actual short fits from both M-step variants, scalar dimensions, RNG restoration,
+# exclusion of simulation truths, and draw-wise reconstruction of log(A Z).
+#
+# Model:
+#   L_it = mu_it + c * log(sum_k W_ik^2 * Z_kt) + c * E_it,
+#   E_it ~ Laplace(0, alpha0), Z_kt ~ expPS(1/2, theta_k).
+#
+# Usage with the tutorial's existing sim and fit objects:
+#   source("recover_maxid_Z.R")
+#   latent <- recover_maxid_Z(sim, fit, ndraw=2000, burn=1000)
+#   latent$Z_mean              # K x T posterior means, on the Z scale
+#   latent$Z_median            # K x T posterior medians
+#   latent$Z_lower             # K x T lower equal-tailed bounds
+#   latent$Z_upper             # K x T upper equal-tailed bounds
+#   latent$diagnostics$split_rhat_logZ
+#   latent$diagnostics$ess_logZ # K x T x chain; approximate coordinate ESS
+#
+# Inputs:
+#   dat: observed L (n x T), W (n x K), elev, ghg, alpha0 and model_spec.
+#        Use exactly the weights and covariate scaling used for the fit.
+#        Simulation truth fields such as dat$Z and dat$theta are never used.
+#   fit: beta in (intercept, elevation, GHG) order, theta, cscale, alpha0,
+#        model_spec; optionally q=log(Z) and joint_state as returned by the fit.
+#        Uses fit$theta, not an optional theta_jackknife component.
+#   ndraw: retained draws PER CHAIN and replicate, after thinning.
+#   burn: warm-up sweeps per chain; the existing sampler adapts only here.
+#   thin: sweeps between retained draws. Usually leave at 1.
+#   seeds: distinct integer seeds; defaults to two independent RNG streams.
+#   time_batch: replicates sampled together; bounds the sampler's temporary
+#        n x batch x ndraw log-field array. This does NOT refit any parameters.
+#   use_fit_start: use fit$q/proposals if available. Set FALSE for new fields
+#        or reordered/subset data; initialization then uses the supplied data.
+#   keep_draws: retain Z_draws with dimensions K x T x ndraw x chain.
+#
+# Output intervals condition on the fitted parameters; they do not propagate
+# parameter-estimation uncertainty. They are pointwise, not simultaneous.
+# Z_mean averages exp(q), not exp(mean(q)). logB_mean averages log(A Z), not
+# log(A E[Z]). B_mean = A Z_mean, where A=W^2 without renormalizing A.
+# Z_sd measures conditional posterior spread; Z_mean_mcse measures numerical
+# uncertainty in Z_mean using approximate nonoverlapping batch means.
+# The classic split R-hat on log Z is not rank-normalized. ESS and MCSE are
+# approximate diagnostics, not a guarantee of convergence. All chains use the
+# same starting point, followed by separate warm-up. Inspect difficult tails.
+#
+# Both the classical and location-augmentation fitted objects store q=log(Z),
+# so the same posterior sampler applies to either M-step variant. There is no
+# M-step here: beta, theta, c and alpha0 remain fixed throughout.
+# For the T400 setup, time_batch=10 and ndraw=2000 require about 80 MB for one
+# temporary log-field array. keep_draws=TRUE additionally stores about 115 MB
+# of Z draws for K=9, T=400 and two chains, plus ordinary R working copies.
+
+recover_maxid_Z <- function(dat, fit, ndraw=2000L, burn=1000L, thin=1L,
+                            level=0.95, seeds=c(101L, 202L), time_batch=10L,
+                            use_fit_start=TRUE, keep_draws=FALSE, verbose=TRUE) {
+  required <- c(".maxid_check", "maxid_model_spec", "power_weights",
+                "e_step_joint", ".maxid_initial_q", ".maxid_ess")
+  missing_functions <- required[!vapply(required, exists, logical(1),
+                                        mode="function", inherits=TRUE)]
+  if (length(missing_functions))
+    stop("Source maxid_regression_mcem.R and maxid_regression_fast_fit.R first.")
+  if (!is.list(dat) || !is.list(fit)) stop("dat and fit must be lists.")
+  # Strip simulation truths and unrelated fit history before any computation.
+  observed <- c("L", "W", "elev", "ghg", "alpha0", "model_spec", "alpha", "radii")
+  dat <- .maxid_check(dat[intersect(observed, names(dat))])
+  n <- dat$n; nt <- dat$nt; K <- ncol(dat$W)
+  if (!identical(fit$model_spec, maxid_model_spec()))
+    stop("The fitted model_spec does not match the current uncentered model.")
+  real_finite <- function(x) is.numeric(x) && !is.complex(x) && all(is.finite(x))
+  if (!real_finite(fit$beta) || length(fit$beta)!=3L ||
+      !real_finite(fit$theta) || length(fit$theta)!=K || any(fit$theta<0))
+    stop("fit needs three finite beta values and K finite nonnegative theta values.")
+  if (!real_finite(fit$cscale) || length(fit$cscale)!=1L || fit$cscale<=0 ||
+      !real_finite(fit$alpha0) || length(fit$alpha0)!=1L || fit$alpha0!=dat$alpha0 ||
+      !is.finite(fit$cscale*fit$alpha0) || fit$cscale*fit$alpha0<=0)
+    stop("fit needs positive cscale and the same fixed alpha0 as dat.")
+  fit_alpha <- fit[["alpha", exact=TRUE]]
+  if (!is.null(fit_alpha) && (!real_finite(fit_alpha) ||
+                              length(fit_alpha)!=1L || fit_alpha!=0.5)) stop("alpha must be 1/2.")
+  integer_control <- function(x, minimum, name) {
+    if (!real_finite(x) || length(x)!=1L || x<minimum ||
+        x>.Machine$integer.max || x!=floor(x))
+      stop(name, " must be an integer >= ", minimum, ".")
+    as.integer(x)
+  }
+  ndraw <- integer_control(ndraw, 20L, "ndraw")
+  burn <- integer_control(burn, 0L, "burn")
+  thin <- integer_control(thin, 1L, "thin")
+  time_batch <- integer_control(time_batch, 1L, "time_batch")
+  time_batch <- min(time_batch, nt)
+  if (as.double(burn)+as.double(ndraw)*thin>.Machine$integer.max)
+    stop("Too many sampler sweeps.")
+  if (!real_finite(level) || length(level)!=1L || level<=0 || level>=1)
+    stop("level must be between 0 and 1.")
+  if (!real_finite(seeds) || !length(seeds) || anyDuplicated(seeds) ||
+      any(seeds<0 | seeds>.Machine$integer.max | seeds!=floor(seeds)))
+    stop("seeds must be distinct nonnegative integers.")
+  seeds <- as.integer(seeds); chains <- length(seeds)
+  for (name in c("use_fit_start", "keep_draws", "verbose")) {
+    value <- get(name)
+    if (!is.logical(value) || length(value)!=1L || is.na(value))
+      stop(name, " must be TRUE or FALSE.")
+  }
+  beta <- as.numeric(fit$beta); theta <- as.numeric(fit$theta)
+  dat$cscale <- as.numeric(fit$cscale) # never use the simulator's cscale
+  q_start <- if (use_fit_start) fit$q else NULL
+  proposal_start <- if (!is.null(q_start)) fit$joint_state else NULL
+  if (!is.null(q_start) && (!real_finite(q_start) ||
+                            !identical(dim(q_start), c(K, nt))))
+    stop("fit$q must be K x T; use use_fit_start=FALSE for new/subset fields.")
+  if (!is.null(proposal_start) && (!is.list(proposal_start) ||
+                                   !identical(dim(proposal_start$covariance), c(K, K, nt)) ||
+                                   !real_finite(proposal_start$covariance) ||
+                                   !real_finite(proposal_start$scales) || length(proposal_start$scales)!=nt ||
+                                   any(proposal_start$scales<=0))) stop("Invalid fitted joint proposal state.")
+  
+  # Restore the caller's RNG state, including the absence of a prior state.
+  had_rng <- exists(".Random.seed", envir=.GlobalEnv, inherits=FALSE)
+  old_rng <- if (had_rng) get(".Random.seed", envir=.GlobalEnv) else NULL
+  on.exit({
+    if (had_rng) assign(".Random.seed", old_rng, envir=.GlobalEnv)
+    else if (exists(".Random.seed", envir=.GlobalEnv, inherits=FALSE))
+      rm(".Random.seed", envir=.GlobalEnv)
+  }, add=TRUE)
+  # Keep a separate continuing RNG state for each chain across time batches.
+  rng <- lapply(seeds, function(seed) {set.seed(seed); get(".Random.seed", .GlobalEnv)})
+  basis_names <- colnames(dat$W)
+  if (is.null(basis_names)) basis_names <- paste0("Z", seq_len(K))
+  time_names <- colnames(dat$L)
+  if (is.null(time_names)) time_names <- paste0("t", seq_len(nt))
+  chain_names <- paste0("chain", seq_len(chains))
+  make_matrix <- function() matrix(NA_real_, K, nt,
+                                   dimnames=list(basis_names, time_names))
+  Z_mean <- Z_median <- Z_lower <- Z_upper <- Z_sd <- Z_mean_mcse <-
+    logZ_mean <- split_rhat <- make_matrix()
+  chain_dimnames <- list(basis_names, time_names, chain_names)
+  chain_mean <- chain_mcse <- ess_logZ <- ess_Z <-
+    array(NA_real_, c(K, nt, chains), dimnames=chain_dimnames)
+  acceptance <- matrix(NA_real_, nt, chains, dimnames=list(time_names, chain_names))
+  logB_mean <- matrix(0, n, nt, dimnames=list(rownames(dat$L), time_names))
+  Z_draws <- if (keep_draws) array(NA_real_, c(K, nt, ndraw, chains),
+                                   dimnames=list(basis_names, time_names, NULL, chain_names)) else NULL
+  probs <- c((1-level)/2, 0.5, (1+level)/2)
+  
+  batch_mcse <- function(x) {
+    size <- max(2L, floor(sqrt(length(x)))); nb <- length(x)%/%size
+    if (nb<5L) return(NA_real_)
+    averages <- colMeans(matrix(x[seq_len(size*nb)], nrow=size))
+    sd(averages)/sqrt(nb)
+  }
+  classic_split_rhat <- function(x) { # draws x chains, on log Z
+    if (ncol(x)<2L) return(NA_real_)
+    half <- nrow(x)%/%2L
+    halves <- cbind(x[seq_len(half), , drop=FALSE],
+                    x[nrow(x)-half+seq_len(half), , drop=FALSE])
+    within <- mean(apply(halves, 2L, var))
+    between <- half*var(colMeans(halves))
+    if (!is.finite(within) || within<=0) return(NA_real_)
+    sqrt(max(1, ((half-1)/half*within+between/half)/within))
+  }
+  
+  for (first in seq.int(1L, nt, by=time_batch)) {
+    times <- seq.int(first, min(nt, first+time_batch-1L)); nb <- length(times)
+    block <- dat
+    block$L <- dat$L[, times, drop=FALSE]
+    block$ghg <- dat$ghg[times]; block$nt <- nb
+    if (is.null(q_start)) {
+      mu <- outer(beta[1]+beta[2]*dat$elev, rep(1, nb))+
+        outer(rep(1, n), beta[3]*block$ghg)
+      q0 <- .maxid_initial_q(dat$A, (block$L-mu)/dat$cscale,
+                             theta, alpha0=dat$alpha0)
+    } else q0 <- q_start[, times, drop=FALSE]
+    joint0 <- if (is.null(proposal_start)) NULL else list(
+      covariance=proposal_start$covariance[, , times, drop=FALSE],
+      scales=proposal_start$scales[times])
+    q_pool <- array(NA_real_, c(K, nb, ndraw, chains))
+    for (chain in seq_len(chains)) {
+      assign(".Random.seed", rng[[chain]], envir=.GlobalEnv)
+      e <- e_step_joint(block, beta, theta, q0, joint0,
+                        ndraw=ndraw, burn=burn, thin=thin)
+      rng[[chain]] <- get(".Random.seed", envir=.GlobalEnv)
+      q_pool[, , , chain] <- e$qdraws
+      ess_logZ[, times, chain] <- e$ess
+      acceptance[times, chain] <- e$acceptance
+      logB_mean[, times] <- logB_mean[, times, drop=FALSE]+
+        matrix(rowMeans(matrix(e$logs, n*nb, ndraw)), n, nb)/chains
+      rm(e)
+    }
+    for (j in seq_len(nb)) {
+      tt <- times[j]
+      q <- matrix(q_pool[, j, , , drop=FALSE], K, ndraw*chains)
+      z <- exp(q)
+      if (any(!is.finite(z))) stop("Nonfinite Z draws; inspect the sampler at time ", tt)
+      Z_mean[, tt] <- rowMeans(z); logZ_mean[, tt] <- rowMeans(q)
+      Z_sd[, tt] <- apply(z, 1L, sd)
+      bounds <- matrix(apply(z, 1L, quantile, probs=probs, names=FALSE), 3L, K)
+      Z_lower[, tt] <- bounds[1L, ]; Z_median[, tt] <- bounds[2L, ]
+      Z_upper[, tt] <- bounds[3L, ]
+      for (chain in seq_len(chains)) {
+        cols <- (chain-1L)*ndraw+seq_len(ndraw)
+        zz <- z[, cols, drop=FALSE]
+        chain_mean[, tt, chain] <- rowMeans(zz)
+        chain_mcse[, tt, chain] <- apply(zz, 1L, batch_mcse)
+        ess_Z[, tt, chain] <- apply(zz, 1L, .maxid_ess)
+        if (keep_draws) Z_draws[, tt, , chain] <- zz
+      }
+      Z_mean_mcse[, tt] <- sqrt(rowSums(matrix(chain_mcse[, tt, ], K, chains)^2))/chains
+      for (k in seq_len(K)) split_rhat[k, tt] <-
+        classic_split_rhat(matrix(q[k, ], ndraw, chains))
+    }
+    if (verbose) message("Recovered Z for replicates ", first, "--", tail(times, 1),
+                         " of ", nt, "; ", chains, " chains x ", ndraw, " draws.")
+    rm(q_pool)
+  }
+  issues <- character()
+  if (any(!is.finite(ess_logZ)) || any(!is.finite(ess_Z)))
+    issues <- c(issues, "some coordinate ESS values are unavailable")
+  if (any(ess_logZ<100, na.rm=TRUE) || any(ess_Z<100, na.rm=TRUE))
+    issues <- c(issues, "some coordinates have ESS below 100 per chain")
+  if (chains>1L && (any(!is.finite(split_rhat)) || any(split_rhat>1.05, na.rm=TRUE)))
+    issues <- c(issues, "some log-Z split R-hat values exceed 1.05 or are unavailable")
+  if (length(issues)) warning(paste0(paste(issues, collapse="; "),
+                                     ". Inspect diagnostics and increase sampling if needed; summaries are still returned."),
+                              call.=FALSE)
+  B_mean <- dat$A %*% Z_mean
+  dimnames(B_mean) <- dimnames(logB_mean)
+  list(Z_mean=Z_mean, Z_median=Z_median, Z_lower=Z_lower, Z_upper=Z_upper,
+       Z_sd=Z_sd, Z_mean_mcse=Z_mean_mcse, logZ_mean=logZ_mean,
+       B_mean=B_mean, logB_mean=logB_mean, spatial_mean=dat$cscale*logB_mean,
+       Z_draws=Z_draws,
+       diagnostics=list(ess_logZ=ess_logZ, ess_Z=ess_Z,
+                        split_rhat_logZ=split_rhat, acceptance=acceptance,
+                        chain_mean=chain_mean, chain_mean_mcse=chain_mcse, issues=issues),
+       parameters=list(beta=fit$beta, theta=fit$theta, cscale=dat$cscale,
+                       alpha0=dat$alpha0, alpha=0.5, model_spec=dat$model_spec),
+       controls=list(ndraw=ndraw, burn=burn, thin=thin, level=level, seeds=seeds,
+                     time_batch=time_batch, use_fit_start=use_fit_start,
+                     keep_draws=keep_draws),
+       note=paste("Conditional latent summaries at fixed fitted parameters.",
+                  "Intervals do not include parameter-estimation uncertainty.",
+                  "No parameters were reestimated. MCSE/ESS and classic log-Z split R-hat",
+                  "are approximate sampling diagnostics, not proof of convergence."))
+}

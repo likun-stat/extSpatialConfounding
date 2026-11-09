@@ -220,7 +220,7 @@ Since each covariate has sample standard deviation one, beta_elev and beta_ghg r
 For nine bases the pattern used in this example is
 
 ```{r true-parameters}
-theta <- c(0, 0.0001, 0, 0.0006, 0.005, 0.0015, 0, 0.002, 0.003)
+theta <- c(0, 0.001, 0, 0.006, 0.05, 0.015, 0, 0.02, 0.03)
 beta <- c(intercept=1, elevation=0.5, GHG=0.3)
 cbind(d$knots, theta=theta)
 ```
@@ -264,27 +264,43 @@ The details for MCEM algorithm are given in Sections 6--8. To fit the model on t
 
 ```{r fit-model, eval=params$run_fit}
 fit <- fit_mcem_fast(
-  sim,
-  iterations=120,
-  draws_start=100,
-  draws_end=500,
-  burn_first=800,
-  burn=150,
-  m_cycles = 2,
-  seed=91,
-  estimate_c=FALSE,c_fixed=0.12,
-  location_augmentation=TRUE,
-  uncertainty="louis"   # adds approximate iteration-level SE/CI bands; Section 9.5
+    sim,
+    iterations=120,
+    draws_start=100,
+    draws_end=500,
+    burn_first=800,
+    burn=150,
+    m_cycles = 2,
+    seed=91,
+    estimate_c=TRUE,
+    location_augmentation=FALSE
 )
 
 fit$beta             # Estimated regression location coefficients
 fit$theta            # Estimated local expPS tilts: raw EM fixed-point value
 fit$theta_jackknife  # Bias-corrected tilts (Section 8.4); the recommended estimate
-fit$cscale           # Fixed at 0.12 here; alpha0 remains fixed at sim$alpha0
+fit$cscale           # True value is 0.12; alpha0 remains fixed at sim$alpha0
 subset(fit$uncertainty, iteration==nrow(fit$history))[,c("parameter","estimate","se","lower","upper")]
 ```
 
-### 3.6 Visualize the parameter estimates
+### 3.6 Estimate the latent $Z$'s
+We can recover latent coefficients at fixed fitted max-id regression parameters:
+```{r recover-Z, eval=params$run_fit}
+latent <- recover_maxid_Z(
+  sim, fit,
+  ndraw = 2000,  # retained draws per chain
+  burn = 1000
+)
+
+Z_hat <- latent$Z_mean     # K × T posterior means
+plot(log(sim$Z), log(Z_hat), xlab="true Z's on log scale", ylab="estimated Z's on log scale")
+# latent$Z_median
+# latent$Z_lower            # 95% interval lower bounds
+# latent$Z_upper            # 95% interval upper bounds
+# latent$diagnostics
+```
+
+### 3.7 Visualize the parameter estimates
 
 `plot_mcem_traces()` draws the same beta and theta traces as a hand-written `matplot()` would, but also shades the Louis-information bands from `uncertainty="louis"` and marks the jackknife-corrected final tilts (Section 8.4):
 
